@@ -7,6 +7,7 @@
 #port and create a new thread for each client that connects.
 import socket
 import threading
+from file_commands import handle_command
 
 # 0.0.0.0 basically mean it will listen on all available interfaces.
 host = '0.0.0.0'
@@ -37,8 +38,14 @@ def handle_client(connection, addr):
                     break
                 print('[*] Data received from {}: {}'.format(addr[1], data.decode('utf-8')))
                 # echo data back to origin (later: parse commands here)
-                connection.send(dashes.encode('utf-8') + data)
-    except ConnectionResetError:
+                try:
+                    # connection is passed so upload/download can send and receive file bytes
+                    reply = handle_command(data.decode('utf-8'), connection)
+                except Exception as e:
+                    print(f'[!] Error occurred while handling command: {e}')
+                    reply = 'Error occurred while handling command.'
+                connection.sendall(reply.encode('utf-8'))
+    except (ConnectionError, OSError):  # covers reset, aborted and broken-pipe disconnects
         print(f'[!] Client {addr[1]} dropped the connection unexpectedly')
     finally:
         with clients_lock:
@@ -48,14 +55,14 @@ def handle_client(connection, addr):
  
 def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_tcp:
-        # lets you restart the server right away without an "address in use" error
+        #lets you restart the server right away without an address in use error
         server_tcp.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_tcp.bind((host, port))
         server_tcp.listen(6)
         print(f'[*] Server listening on {host}:{port}')
-        # wait for client connections forever
+        #wait for client connections forever
         while True:
-            # accept() pauses here until a client connects
+            #accept() pauses here until a client connects
             connection, addr = server_tcp.accept()
             # hand the client to a new thread, then go straight back to accept()
             thread = threading.Thread(target=handle_client, args=(connection, addr), daemon=True)
@@ -64,4 +71,3 @@ def main():
  
 if __name__ == '__main__':
     main()
- 
