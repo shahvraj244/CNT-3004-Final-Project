@@ -1,0 +1,18 @@
+# Course handout and Word lock files
+Cloud Server Network Analysis Project.docx
+~$*
+
+# Secrets: never commit passwords, keys or certificates
+secrets/
+.env
+
+# Runtime data and large test files
+server_storage/
+stats/
+test_files/
+*.part
+
+# Python
+__pycache__/
+*.pyc
+.venv/
