@@ -1,18 +1,57 @@
 #file_commands.py
-#Checks if the command is valid and returns the command and arguments as a list
+#Cheks if the command entered by the users are valid and returns the reply text to the server.py file 
 
+import json
 import os
 import threading
 
 from protocol import err, ok, recv_msg, send_msg
 
 STORAGE = 'server_storage'
-CHUNK_SIZE = 65536  # size for file data, 64 KB at a time
+REGISTRY_FILE = 'server_registry.json'  # remembers original name -> stored ID, survives restarts
+CHUNK_SIZE = 65536  #size for a file for upload and download
 os.makedirs(STORAGE, exist_ok=True) #creates the storage directory if it doesn't exist
 
-# files being uploaded/downloaded right now, delete is blocked for these
+#types of file extensions that are supported by the server, any other file type will be rejected
+TYPES = {
+    '.txt':  'txt',
+    '.pdf':  'txt',
+    '.docx': 'txt',
+    '.mp3':  'aud',
+    '.wav':  'aud',
+    '.mp4':  'vid',
+    '.mov':  'vid',
+}
+'''Naming convention to store files on the server: each type has a prefix and a counter, e.g. txt001, aud002, vid003.'''
+# counters only go up, so a number is never used twice, even after a delete
+registry = {'counters': {'txt': 0, 'aud': 0, 'vid': 0}, 'files': {}}
+if os.path.exists(REGISTRY_FILE):
+    with open(REGISTRY_FILE) as f:
+        registry = json.load(f)
+registry_lock = threading.Lock()  # two uploads at once must not get the same number
+
+#files being uploaded/downloaded right now, delete is blocked for these
 in_use = set()
-in_use_lock = threading.Lock()  # threads share in_use, so a lock protects it
+in_use_lock = threading.Lock()  #threads share in_use, so a lock protects it
+
+def save_registry():
+    '''writes the registry to disk, caller must hold registry_lock'''
+    with open(REGISTRY_FILE, 'w') as f:
+        json.dump(registry, f)
+
+def assign_id(name, prefix):
+    '''new name gets the next number for its type (txt001, txt002...), an existing name keeps its ID'''
+    with registry_lock:
+        if name not in registry['files']:
+            registry['counters'][prefix] += 1
+            registry['files'][name] = f"{prefix}{registry['counters'][prefix]:03d}"
+            save_registry()
+        return registry['files'][name]
+
+def real_path(path, name):
+    '''where the file really is on disk (original name -> stored ID), None if not stored'''
+    stored_id = registry['files'].get(name)
+    return os.path.join(os.path.dirname(path), stored_id) if stored_id else None
 
 def claim(path):
     '''marks a file as in use, returns False if another client already has it'''
@@ -52,7 +91,7 @@ def receive_file(connection, file_path, size):
 def do_upload(message, connection):
     '''upload <name> <size>: asks before overwriting, then receives the file'''
     parts = message.split()
-    if len(parts) < 3 or not parts[-1].isdigit():  # client adds the size as the last word
+    if len(parts) < 3 or not parts[-1].isdigit():  #user adds the size as the last word
         return err('Usage: upload <filename>')
     name = ' '.join(parts[1:-1])
     size = int(parts[-1])
@@ -64,21 +103,25 @@ def do_upload(message, connection):
         return err('That folder does not exist on the server.')
     if os.path.isdir(path):
         return err(f'{name} is a folder, not a file.')
+    prefix = TYPES.get(os.path.splitext(name)[1].lower())  #type of files audio, video, or text
+    if prefix is None:
+        return err('Only text, audio and video files are supported.')
     if not claim(path):
         return err(f'{name} is being used right now. Try again in a moment.')
     temp = path + '.part'
     try:
-        if os.path.exists(path):
-            send_msg(connection, 'EXISTS')  # client asks the user yes/no and sends the answer back
+        if name in registry['files']:  #a file with this name is already stored
+            send_msg(connection, 'EXISTS')  #client asks the user yes/no and sends the answer back
             answer = (recv_msg(connection) or '').strip().lower()
             if answer not in ('yes', 'y'):
                 return err('Upload cancelled.')
-        send_msg(connection, 'READY')  # tells the client to start sending the file bytes
-        # save to a temp file first so a failed upload never destroys the old file
+        send_msg(connection, 'READY')  #tells the client to start sending the file bytes
+        #save to a temp file first so a failed upload never destroys the old file
         if not receive_file(connection, temp, size):
             return err('Upload failed: connection lost.')
-        os.replace(temp, path)  # swaps the finished file into place, overwriting the old one
-        return ok(f'{name} uploaded.')
+        stored_id = assign_id(name, prefix)
+        os.replace(temp, os.path.join(os.path.dirname(path), stored_id))  # saved under its ID, e.g. txt001
+        return ok(f'{name} uploaded as {stored_id}.')
     finally:
         if os.path.exists(temp):
             os.remove(temp)  # cleans up half-finished uploads
@@ -94,16 +137,17 @@ def do_download(message, connection):
         path = safe_path(name)
     except ValueError:
         return err('That file name is not allowed.')
-    if not os.path.isfile(path):
+    real = real_path(path, name)
+    if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist on the server.')
     if not claim(path):
         return err(f'{name} is being used right now. Try again in a moment.')
     try:
-        send_msg(connection, f'SIZE {os.path.getsize(path)}')  # client needs the size
+        send_msg(connection, f'SIZE {os.path.getsize(real)}')  # client needs the size
         answer = (recv_msg(connection) or '').strip()
         if answer != 'GO':
             return err('Download cancelled.')
-        with open(path, 'rb') as f:
+        with open(real, 'rb') as f:
             while True:
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
@@ -123,12 +167,16 @@ def do_delete(message):
         path = safe_path(name)
     except ValueError:
         return err('That file name is not allowed.')
-    if not os.path.isfile(path):
+    real = real_path(path, name)
+    if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist.')
     if not claim(path):
         return err(f'{name} is being used right now, so it was not deleted.')
     try:
-        os.remove(path)
+        os.remove(real)
+        with registry_lock:
+            del registry['files'][name]  # the counter stays, so this number is never reused
+            save_registry()
         return ok(f'{name} deleted.')
     finally:
         release(path)
@@ -141,8 +189,18 @@ def handle_command(message, connection): #function to check what client's input 
     command = parts[0].lower() #first word set to command, rest are args
 
     if command == 'help':
-            return ok('Commands: connect, upload <file>, download <file>, delete <file>, '
-            'dir, subfolder create <name>, subfolder delete <name>, quit')
+        return ok(
+        'Server commands:\n'
+        '  upload <file> <size>       send a file to the server\n'
+        '  download <file>            fetch a file from the server\n'
+        '  delete <file>              remove a stored file\n'
+        '  dir                        list files and folders\n'
+        '  subfolder create|delete <name>   manage folders\n'
+        '  help                       show this message\n'
+        'Client commands (type these at your own prompt, not here):\n'
+        '  connect                    open the connection\n'
+        '  quit                       close the connection and exit'
+    )
 
     if command == 'upload':
         return do_upload(message, connection)
@@ -155,12 +213,11 @@ def handle_command(message, connection): #function to check what client's input 
     
     if command == 'dir':
         items = []
-        for root, dirs, files in os.walk(STORAGE):
+        for root, dirs, _ in os.walk(STORAGE):
             for d in dirs:
                 items.append(os.path.relpath(os.path.join(root, d), STORAGE) + '/')
-            for f in files:
-                if not f.endswith('.part'):  # hide unfinished uploads
-                    items.append(os.path.relpath(os.path.join(root, f), STORAGE))
+        with registry_lock:  #files are listed from the registry, so users see their own names
+            items += [f'{name} ({stored_id})' for name, stored_id in registry['files'].items()]
         return ok('\n'.join(sorted(items)) if items else 'The server has no files yet.')
 
     if command == 'subfolder': #function to create or delete subfolders in the server storage directory

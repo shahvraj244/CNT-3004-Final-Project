@@ -13,7 +13,6 @@ from protocol import ProtocolError, err, recv_msg, send_msg
 # 0.0.0.0 basically mean it will listen on all available interfaces.
 host = '0.0.0.0'
 port = 3300
-dashes = '----->'
 
 
 #Client connection handler function. This function will be run in a 
