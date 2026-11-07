@@ -1,18 +1,15 @@
-   __pycache__/
-   venv/
-   .env
-   *.pem
-   *.key
-   *.mp4
-   *.wav
-   *.mp3
-   test_files/
-   server_storage/__pycache__/
-server_storage/
-server_metrics.csv
-transfer_stats.csv
-server_registry.json*
-users.json
-downloads/
+__pycache__/
+venv/
+.env
 *.pem
 *.key
+*.mp4
+*.wav
+*.mp3
+test_files/
+server_storage/
+server_registry.json*
+users.json
+transfer_stats.csv
+server_metrics.csv
+downloads/

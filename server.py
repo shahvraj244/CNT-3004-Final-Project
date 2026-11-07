@@ -8,11 +8,11 @@
 import socket
 import threading
 from file_commands import handle_command
+from protocol import ProtocolError, err, recv_msg, send_msg
 
 # 0.0.0.0 basically mean it will listen on all available interfaces.
 host = '0.0.0.0'
 port = 3300
-BUFFER_SIZE = 4096
 dashes = '----->'
 
 
@@ -31,20 +31,23 @@ def handle_client(connection, addr):
     try:
         with connection:
             while True:
-                # receive bytes from this client
-                data = connection.recv(BUFFER_SIZE)
-                # empty result means the client disconnected
-                if not data:
+                # wait for one complete message from this client
+                message = recv_msg(connection)
+                # None means the client disconnected
+                if message is None:
                     break
-                print('[*] Data received from {}: {}'.format(addr[1], data.decode('utf-8')))
-                # echo data back to origin (later: parse commands here)
+                print('[*] Data received from {}: {}'.format(addr[1], message))
                 try:
                     # connection is passed so upload/download can send and receive file bytes
-                    reply = handle_command(data.decode('utf-8'), connection)
+                    reply = handle_command(message, connection)
+                except (ConnectionError, ProtocolError):
+                    raise  # this session can't continue, handled below
                 except Exception as e:
                     print(f'[!] Error occurred while handling command: {e}')
-                    reply = 'Error occurred while handling command.'
-                connection.sendall(reply.encode('utf-8'))
+                    reply = err('Error occurred while handling command.')
+                send_msg(connection, reply)
+    except ProtocolError as e:
+        print(f'[!] Client {addr[1]} sent a bad message: {e}')
     except (ConnectionError, OSError):  # covers reset, aborted and broken-pipe disconnects
         print(f'[!] Client {addr[1]} dropped the connection unexpectedly')
     finally:
