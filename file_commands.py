@@ -3,13 +3,16 @@
 
 import json
 import os
+import shutil
 import threading
+from contextlib import contextmanager
 
 from protocol import err, ok, recv_msg, send_msg
 
 STORAGE = 'server_storage'
 REGISTRY_FILE = 'server_registry.json'  # remembers original name -> stored ID, survives restarts
 CHUNK_SIZE = 65536  #size for a file for upload and download
+TRANSFER_TIMEOUT = 30  # seconds of silence allowed while file bytes are moving
 os.makedirs(STORAGE, exist_ok=True) #creates the storage directory if it doesn't exist
 
 #types of file extensions that are supported by the server, any other file type will be rejected
@@ -31,13 +34,16 @@ if os.path.exists(REGISTRY_FILE):
 registry_lock = threading.Lock()  # two uploads at once must not get the same number
 
 #files being uploaded/downloaded right now, delete is blocked for these
-in_use = set()
+# value = number of active downloads, or -1 when an upload/delete has the file
+in_use = {}
 in_use_lock = threading.Lock()  #threads share in_use, so a lock protects it
 
 def save_registry():
     '''writes the registry to disk, caller must hold registry_lock'''
-    with open(REGISTRY_FILE, 'w') as f:
+    temp = REGISTRY_FILE + '.tmp'  # write aside first so a crash can't corrupt the registry
+    with open(temp, 'w') as f:
         json.dump(registry, f)
+    os.replace(temp, REGISTRY_FILE)
 
 def assign_id(name, prefix):
     '''new name gets the next number for its type (txt001, txt002...), an existing name keeps its ID'''
@@ -53,18 +59,38 @@ def real_path(path, name):
     stored_id = registry['files'].get(name)
     return os.path.join(os.path.dirname(path), stored_id) if stored_id else None
 
-def claim(path):
-    '''marks a file as in use, returns False if another client already has it'''
+def claim(path, shared=False):
+    '''marks a file as in use, returns False if another client already has it
+    (shared=True lets several downloads read the same file at once)'''
     with in_use_lock:
-        if path in in_use:
+        users = in_use.get(path, 0)
+        if shared:
+            if users < 0:
+                return False
+            in_use[path] = users + 1
+            return True
+        if users != 0:
             return False
-        in_use.add(path)
+        in_use[path] = -1
         return True
 
 def release(path):
     '''marks a file as no longer in use'''
     with in_use_lock:
-        in_use.discard(path)
+        if in_use.get(path, 0) > 1:
+            in_use[path] -= 1  # other downloads are still reading it
+        else:
+            in_use.pop(path, None)
+
+@contextmanager
+def transfer_timeout(connection):
+    '''short timeout while file bytes move, so a stalled client can't hold the file forever'''
+    previous = connection.gettimeout()
+    connection.settimeout(TRANSFER_TIMEOUT)
+    try:
+        yield
+    finally:
+        connection.settimeout(previous)
 
 def safe_path(name):
     '''converts a filename to a safe path within the STORAGE directory'''
@@ -106,6 +132,8 @@ def do_upload(message, connection):
     prefix = TYPES.get(os.path.splitext(name)[1].lower())  #type of files audio, video, or text
     if prefix is None:
         return err('Only text, audio and video files are supported.')
+    if size > shutil.disk_usage(STORAGE).free:  # refuse before any bytes are sent
+        return err('Not enough free space on the server.')
     if not claim(path):
         return err(f'{name} is being used right now. Try again in a moment.')
     temp = path + '.part'
@@ -117,7 +145,9 @@ def do_upload(message, connection):
                 return err('Upload cancelled.')
         send_msg(connection, 'READY')  #tells the client to start sending the file bytes
         #save to a temp file first so a failed upload never destroys the old file
-        if not receive_file(connection, temp, size):
+        with transfer_timeout(connection):
+            received = receive_file(connection, temp, size)
+        if not received:
             return err('Upload failed: connection lost.')
         stored_id = assign_id(name, prefix)
         os.replace(temp, os.path.join(os.path.dirname(path), stored_id))  # saved under its ID, e.g. txt001
@@ -140,14 +170,14 @@ def do_download(message, connection):
     real = real_path(path, name)
     if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist on the server.')
-    if not claim(path):
+    if not claim(path, shared=True):  # many clients may download the same file together
         return err(f'{name} is being used right now. Try again in a moment.')
     try:
         send_msg(connection, f'SIZE {os.path.getsize(real)}')  # client needs the size
         answer = (recv_msg(connection) or '').strip()
         if answer != 'GO':
             return err('Download cancelled.')
-        with open(real, 'rb') as f:
+        with open(real, 'rb') as f, transfer_timeout(connection):
             while True:
                 chunk = f.read(CHUNK_SIZE)
                 if not chunk:
