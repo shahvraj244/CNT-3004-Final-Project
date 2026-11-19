@@ -13,3 +13,16 @@ users.json
 transfer_stats.csv
 server_metrics.csv
 downloads/
+
+# Restored after the initial-protocol merge
+# Course handout and Word lock files
+Cloud Server Network Analysis Project.docx
+~$*
+# Secrets folder: server key, certificate and password hashes (Stage 2)
+secrets/
+# Runtime data
+stats/
+*.part
+# Python
+*.pyc
+.venv/
