@@ -87,6 +87,16 @@ C: help
 
 File names can contain spaces. Paths inside the server storage use forward slashes, for example `photos/cat.png`. Subfolder names can't contain spaces.
 
+## When things go wrong
+
+What the client should expect, and show the user:
+
+- **Files in use.** Several clients can download the same file at once. Uploading or deleting a file while anyone is uploading or downloading it gets `ERR <name> is being used right now...`, and the user can try again later.
+- **Not enough space.** An upload that wouldn't fit gets `ERR Not enough space on the server for <name>.` instead of `READY`, so no file bytes are sent.
+- **File types.** Only the extensions listed in `TYPES` in `file_commands.py` are accepted. Anything else gets `ERR Only text, audio and video files are supported.`
+- **Time limits.** The server closes the connection if the client takes more than 120 seconds to answer `EXISTS` or `SIZE`, or goes 60 seconds without sending or reading any file data. There's no limit while the connection sits waiting for the next command.
+- **Transfers that break halfway.** Once raw file bytes have started moving, the server can't send an `ERR` in the middle, because the client couldn't tell it apart from file data. So it closes the connection instead. The client sees a send that fails with a connection error, or a receive that returns no data before the promised size. Tell the user the transfer failed and let them reconnect. A failed upload never replaces the old copy of the file on the server.
+
 ## Login and encryption (coming next)
 
 **This section isn't live yet.** Until it lands, the server accepts plain TCP connections with no login. It will be the only change to how a client connects.

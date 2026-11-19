@@ -7,7 +7,7 @@
 #port and create a new thread for each client that connects.
 import socket
 import threading
-from file_commands import handle_command
+from file_commands import TransferAborted, handle_command
 from protocol import ProtocolError, err, recv_msg, send_msg
 
 # 0.0.0.0 basically mean it will listen on all available interfaces.
@@ -39,7 +39,7 @@ def handle_client(connection, addr):
                 try:
                     # connection is passed so upload/download can send and receive file bytes
                     reply = handle_command(message, connection)
-                except (ConnectionError, ProtocolError):
+                except (ConnectionError, ProtocolError, TimeoutError, TransferAborted):
                     raise  # this session can't continue, handled below
                 except Exception as e:
                     print(f'[!] Error occurred while handling command: {e}')
@@ -47,6 +47,10 @@ def handle_client(connection, addr):
                 send_msg(connection, reply)
     except ProtocolError as e:
         print(f'[!] Client {addr[1]} sent a bad message: {e}')
+    except TransferAborted as e:
+        print(f'[!] Client {addr[1]}: {e}, closing the connection')
+    except TimeoutError:  # must come before OSError, which it is a type of
+        print(f'[!] Client {addr[1]} stopped responding, closing the connection')
     except (ConnectionError, OSError):  # covers reset, aborted and broken-pipe disconnects
         print(f'[!] Client {addr[1]} dropped the connection unexpectedly')
     finally:
