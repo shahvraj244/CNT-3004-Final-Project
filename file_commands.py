@@ -5,8 +5,10 @@ import json
 import os
 import shutil
 import threading
+import time
 from contextlib import contextmanager
 
+from analysis import collector
 from protocol import err, ok, recv_msg, send_msg
 
 STORAGE = 'server_storage'
@@ -92,6 +94,13 @@ def transfer_timeout(connection):
     finally:
         connection.settimeout(previous)
 
+def _record_transfer(kind, client, name, size, start, success):
+    '''records an upload/download/delete event for analysis.py'''
+    collector.record(kind, client=client, size_bytes=size,
+                     duration_ms=(time.perf_counter() - start) * 1000,
+                     success=success, details=name)
+
+
 def safe_path(name):
     '''converts a filename to a safe path within the STORAGE directory'''
     full = os.path.abspath(os.path.join(STORAGE, name)) #path to file/folder
@@ -114,8 +123,9 @@ def receive_file(connection, file_path, size):
             remaining -= len(chunk)
     return True
 
-def do_upload(message, connection):
+def do_upload(message, connection, client=None):
     '''upload <name> <size>: asks before overwriting, then receives the file'''
+    start = time.perf_counter()
     parts = message.split()
     if len(parts) < 3 or not parts[-1].isdigit():  #user adds the size as the last word
         return err('Usage: upload <filename>')
@@ -142,23 +152,27 @@ def do_upload(message, connection):
             send_msg(connection, 'EXISTS')  #client asks the user yes/no and sends the answer back
             answer = (recv_msg(connection) or '').strip().lower()
             if answer not in ('yes', 'y'):
+                _record_transfer('upload', client, name, size, start, success=False)
                 return err('Upload cancelled.')
         send_msg(connection, 'READY')  #tells the client to start sending the file bytes
         #save to a temp file first so a failed upload never destroys the old file
         with transfer_timeout(connection):
             received = receive_file(connection, temp, size)
         if not received:
+            _record_transfer('upload', client, name, size, start, success=False)
             return err('Upload failed: connection lost.')
         stored_id = assign_id(name, prefix)
         os.replace(temp, os.path.join(os.path.dirname(path), stored_id))  # saved under its ID, e.g. txt001
+        _record_transfer('upload', client, name, size, start, success=True)
         return ok(f'{name} uploaded as {stored_id}.')
     finally:
         if os.path.exists(temp):
             os.remove(temp)  # cleans up half-finished uploads
         release(path)
 
-def do_download(message, connection):
+def do_download(message, connection, client=None):
     '''download <name>: sends the size, waits for GO, then sends the file'''
+    start = time.perf_counter()
     parts = message.split()
     if len(parts) < 2:
         return err('Usage: download <filename>')
@@ -170,12 +184,14 @@ def do_download(message, connection):
     real = real_path(path, name)
     if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist on the server.')
+    size = os.path.getsize(real)
     if not claim(path, shared=True):  # many clients may download the same file together
         return err(f'{name} is being used right now. Try again in a moment.')
     try:
-        send_msg(connection, f'SIZE {os.path.getsize(real)}')  # client needs the size
+        send_msg(connection, f'SIZE {size}')  # client needs the size
         answer = (recv_msg(connection) or '').strip()
         if answer != 'GO':
+            _record_transfer('download', client, name, size, start, success=False)
             return err('Download cancelled.')
         with open(real, 'rb') as f, transfer_timeout(connection):
             while True:
@@ -183,12 +199,14 @@ def do_download(message, connection):
                 if not chunk:
                     break
                 connection.sendall(chunk)
+        _record_transfer('download', client, name, size, start, success=True)
         return ok(f'{name} downloaded.')
     finally:
         release(path)
 
-def do_delete(message):
+def do_delete(message, client=None):
     '''delete <name>: removes a file unless it is missing or in use'''
+    start = time.perf_counter()
     parts = message.split()
     if len(parts) < 2:
         return err('Usage: delete <filename>')
@@ -200,6 +218,7 @@ def do_delete(message):
     real = real_path(path, name)
     if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist.')
+    size = os.path.getsize(real)
     if not claim(path):
         return err(f'{name} is being used right now, so it was not deleted.')
     try:
@@ -207,11 +226,14 @@ def do_delete(message):
         with registry_lock:
             del registry['files'][name]  # the counter stays, so this number is never reused
             save_registry()
+        collector.record('delete', client=client, size_bytes=size,
+                         duration_ms=(time.perf_counter() - start) * 1000,
+                         success=True, details=name)
         return ok(f'{name} deleted.')
     finally:
         release(path)
 
-def handle_command(message, connection): #function to check what client's input and return the reply text
+def handle_command(message, connection, client=None): #function to check what client's input and return the reply text
     '''checks what client's input and returns the reply text'''
     parts = message.strip().split()
     if not parts:
@@ -233,13 +255,13 @@ def handle_command(message, connection): #function to check what client's input 
     )
 
     if command == 'upload':
-        return do_upload(message, connection)
+        return do_upload(message, connection, client=client)
 
     if command == 'download':
-        return do_download(message, connection)
+        return do_download(message, connection, client=client)
 
     if command == 'delete':
-        return do_delete(message)
+        return do_delete(message, client=client)
     
     if command == 'dir':
         items = []

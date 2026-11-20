@@ -7,6 +7,8 @@
 #port and create a new thread for each client that connects.
 import socket
 import threading
+import time
+from analysis import collector
 from file_commands import handle_command
 from protocol import ProtocolError, err, recv_msg, send_msg
 
@@ -26,6 +28,8 @@ def handle_client(connection, addr):
     """Runs independently: talks to one client until they disconnect."""
     connection.settimeout(IDLE_TIMEOUT) #silent clients will be disconnected after 5 min
     connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    client_name = f'{addr[0]}:{addr[1]}'
+    collector.record('connect', client=client_name)
     with clients_lock:
         clients[addr] = connection
         print(f'[*] Established connection from IP {addr[0]} port: {addr[1]} '
@@ -37,9 +41,10 @@ def handle_client(connection, addr):
                 if message is None:#person is gone
                     break
                 print('[*] Data received from {}: {}'.format(addr[1], message))
+                start = time.perf_counter()
                 try:
-                    #connection is approved for proper uses upload/download can send and receive file bytes
-                    reply = handle_command(message, connection) 
+                    # connection is passed so upload/download can send and receive file bytes
+                    reply = handle_command(message, connection, client=client_name)
                 except (OSError, ProtocolError):
                     #covers timeouts and lost connections: a reply would land in the
                     #middle of file bytes and corrupt the stream, so end the session
@@ -47,6 +52,14 @@ def handle_client(connection, addr):
                 except Exception as e:
                     print(f'[!] Error occurred while handling command: {e}')
                     reply = err('Error occurred while handling command.')
+                # ok() replies start with 'OK ', err() replies with 'ERR '
+                collector.record(
+                    'command',
+                    client=client_name,
+                    duration_ms=(time.perf_counter() - start) * 1000,
+                    success=reply.startswith('OK '),
+                    details=message.strip().split()[0] if message.strip() else '',
+                )
                 send_msg(connection, reply)
     except ProtocolError as e:
         print(f'[!] Client {addr[1]} sent a bad message: {e}')
@@ -58,8 +71,8 @@ def handle_client(connection, addr):
         with clients_lock:
             clients.pop(addr, None)
             print(f'[*] Client {addr[1]} disconnected (clients connected: {len(clients)})')
+        collector.record('disconnect', client=client_name)
 
- 
 def main():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_tcp:
         #lets you restart the server right away without an address in use error
