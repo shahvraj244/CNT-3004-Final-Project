@@ -92,9 +92,9 @@ File names can contain spaces. Paths inside the server storage use forward slash
 What the client should expect, and show the user:
 
 - **Files in use.** Several clients can download the same file at once. Uploading or deleting a file while anyone is uploading or downloading it gets `ERR <name> is being used right now...`, and the user can try again later.
-- **Not enough space.** An upload that wouldn't fit gets `ERR Not enough space on the server for <name>.` instead of `READY`, so no file bytes are sent.
+- **Not enough space.** An upload that wouldn't fit gets `ERR Not enough free space on the server.` instead of `READY`, so no file bytes are sent. The server always keeps 100 MB of its disk free.
 - **File types.** Only the extensions listed in `TYPES` in `file_commands.py` are accepted. Anything else gets `ERR Only text, audio and video files are supported.`
-- **Time limits.** The server closes the connection if the client takes more than 120 seconds to answer `EXISTS` or `SIZE`, or goes 60 seconds without sending or reading any file data. There's no limit while the connection sits waiting for the next command.
+- **Time limits.** The server closes the connection after 5 minutes without a message from the client. That covers waiting between commands and answering `EXISTS` or `SIZE`. While file bytes are moving, the limit is 30 seconds without any data being sent or read. When the next send or receive fails because of this, tell the user they were disconnected and let them reconnect.
 - **Transfers that break halfway.** Once raw file bytes have started moving, the server can't send an `ERR` in the middle, because the client couldn't tell it apart from file data. So it closes the connection instead. The client sees a send that fails with a connection error, or a receive that returns no data before the promised size. Tell the user the transfer failed and let them reconnect. A failed upload never replaces the old copy of the file on the server.
 
 ## Login and encryption (coming next)

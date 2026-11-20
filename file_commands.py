@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import threading
+from contextlib import contextmanager
 
 from protocol import err, ok, recv_msg, send_msg
 
@@ -14,15 +15,9 @@ DATA_DIR = os.path.abspath(os.environ.get('CNT_DATA_DIR', os.path.dirname(os.pat
 STORAGE = os.path.join(DATA_DIR, 'server_storage')
 REGISTRY_FILE = os.path.join(DATA_DIR, 'server_registry.json')  # remembers original name -> stored ID, survives restarts
 CHUNK_SIZE = 65536  #size for a file for upload and download
-PROMPT_TIMEOUT = 120  #seconds the client has to answer EXISTS (yes/no) or SIZE (GO/CANCEL)
-TRANSFER_TIMEOUT = 60  #seconds a transfer can go without moving any data before it is dropped
-MIN_FREE_SPACE = 100 * 1024 * 1024  #an upload must leave at least 100 MB free on the server's disk
+TRANSFER_TIMEOUT = 30  # seconds of silence allowed while file bytes are moving
+MIN_FREE_SPACE = 100 * 1024 * 1024  #an upload must leave at least 100 MB free, so it can't fill the server's disk
 os.makedirs(STORAGE, exist_ok=True) #creates the storage directory if it doesn't exist
-
-
-class TransferAborted(Exception):
-    '''a transfer broke after raw file bytes started moving. The connection can't be used
-    anymore, because there is no way to tell where the file ends and the next message starts'''
 
 
 def remove_partial_uploads():
@@ -52,17 +47,17 @@ if os.path.exists(REGISTRY_FILE):
         registry = json.load(f)
 registry_lock = threading.Lock()  # two uploads at once must not get the same number
 
-#files being uploaded/downloaded right now. Several downloads can share a file,
-#but an upload or a delete needs the file to itself.
-#in_use maps a path to how many downloads have it, or to WRITING
-WRITING = -1
+#files being uploaded/downloaded right now, delete is blocked for these
+# value = number of active downloads, or -1 when an upload/delete has the file
 in_use = {}
 in_use_lock = threading.Lock()  #threads share in_use, so a lock protects it
 
 def save_registry():
     '''writes the registry to disk, caller must hold registry_lock'''
-    with open(REGISTRY_FILE, 'w') as f:
+    temp = REGISTRY_FILE + '.tmp'  # write aside first so a crash can't corrupt the registry
+    with open(temp, 'w') as f:
         json.dump(registry, f)
+    os.replace(temp, REGISTRY_FILE)
 
 def assign_id(name, prefix):
     '''new name gets the next number for its type (txt001, txt002...), an existing name keeps its ID'''
@@ -78,31 +73,38 @@ def real_path(path, name):
     stored_id = registry['files'].get(name)
     return os.path.join(os.path.dirname(path), stored_id) if stored_id else None
 
-def claim_read(path):
-    '''lets a download share the file with other downloads, False if an upload or delete has it'''
+def claim(path, shared=False):
+    '''marks a file as in use, returns False if another client already has it
+    (shared=True lets several downloads read the same file at once)'''
     with in_use_lock:
-        holders = in_use.get(path, 0)
-        if holders == WRITING:
+        users = in_use.get(path, 0)
+        if shared:
+            if users < 0:
+                return False
+            in_use[path] = users + 1
+            return True
+        if users != 0:
             return False
-        in_use[path] = holders + 1
-        return True
-
-def claim_write(path):
-    '''gives an upload or delete the file to itself, False if anyone else is using it'''
-    with in_use_lock:
-        if path in in_use:
-            return False
-        in_use[path] = WRITING
+        in_use[path] = -1
         return True
 
 def release(path):
-    '''gives back one claim on the file'''
+    '''marks a file as no longer in use'''
     with in_use_lock:
-        holders = in_use.get(path, 0)
-        if holders > 1:
-            in_use[path] = holders - 1  #other downloads are still reading it
+        if in_use.get(path, 0) > 1:
+            in_use[path] -= 1  # other downloads are still reading it
         else:
-            in_use.pop(path, None)  #last download finished, or the upload/delete is done
+            in_use.pop(path, None)
+
+@contextmanager
+def transfer_timeout(connection):
+    '''short timeout while file bytes move, so a stalled client can't hold the file forever'''
+    previous = connection.gettimeout()
+    connection.settimeout(TRANSFER_TIMEOUT)
+    try:
+        yield
+    finally:
+        connection.settimeout(previous)
 
 def safe_path(name):
     '''converts a filename to a safe path within the STORAGE directory'''
@@ -144,26 +146,21 @@ def do_upload(message, connection):
     prefix = TYPES.get(os.path.splitext(name)[1].lower())  #type of files audio, video, or text
     if prefix is None:
         return err('Only text, audio and video files are supported.')
-    #checked before any bytes move, so a full disk gives a clean error instead of a broken upload
-    if shutil.disk_usage(STORAGE).free < size + MIN_FREE_SPACE:
-        return err(f'Not enough space on the server for {name}.')
-    if not claim_write(path):
+    if size + MIN_FREE_SPACE > shutil.disk_usage(STORAGE).free:  # refuse before any bytes are sent
+        return err('Not enough free space on the server.')
+    if not claim(path):
         return err(f'{name} is being used right now. Try again in a moment.')
     temp = path + '.part'
     try:
         if name in registry['files']:  #a file with this name is already stored
             send_msg(connection, 'EXISTS')  #client asks the user yes/no and sends the answer back
-            connection.settimeout(PROMPT_TIMEOUT)  #so a user who walks away doesn't lock the file forever
             answer = (recv_msg(connection) or '').strip().lower()
             if answer not in ('yes', 'y'):
                 return err('Upload cancelled.')
         send_msg(connection, 'READY')  #tells the client to start sending the file bytes
-        connection.settimeout(TRANSFER_TIMEOUT)  #a client that stops sending is dropped
         #save to a temp file first so a failed upload never destroys the old file
-        try:
+        with transfer_timeout(connection):
             received = receive_file(connection, temp, size)
-        except OSError as e:  #disk error, timeout or reset while the file bytes were arriving
-            raise TransferAborted(f'upload of {name} stopped halfway ({e})') from e
         if not received:
             return err('Upload failed: connection lost.')
         stored_id = assign_id(name, prefix)
@@ -173,7 +170,6 @@ def do_upload(message, connection):
         if os.path.exists(temp):
             os.remove(temp)  # cleans up half-finished uploads
         release(path)
-        connection.settimeout(None)  #no time limit while waiting for the next command
 
 def do_download(message, connection):
     '''download <name>: sends the size, waits for GO, then sends the file'''
@@ -188,28 +184,22 @@ def do_download(message, connection):
     real = real_path(path, name)
     if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist on the server.')
-    if not claim_read(path):  #other downloads are fine, an upload or delete in progress is not
+    if not claim(path, shared=True):  # many clients may download the same file together
         return err(f'{name} is being used right now. Try again in a moment.')
     try:
         send_msg(connection, f'SIZE {os.path.getsize(real)}')  # client needs the size
-        connection.settimeout(PROMPT_TIMEOUT)  #so a client that never answers doesn't hold the file
         answer = (recv_msg(connection) or '').strip()
         if answer != 'GO':
             return err('Download cancelled.')
-        connection.settimeout(TRANSFER_TIMEOUT)  #a client that stops reading is dropped
-        try:
-            with open(real, 'rb') as f:
-                while True:
-                    chunk = f.read(CHUNK_SIZE)
-                    if not chunk:
-                        break
-                    connection.sendall(chunk)
-        except OSError as e:  #disk error, timeout or reset while the file bytes were leaving
-            raise TransferAborted(f'download of {name} stopped halfway ({e})') from e
+        with open(real, 'rb') as f, transfer_timeout(connection):
+            while True:
+                chunk = f.read(CHUNK_SIZE)
+                if not chunk:
+                    break
+                connection.sendall(chunk)
         return ok(f'{name} downloaded.')
     finally:
         release(path)
-        connection.settimeout(None)  #no time limit while waiting for the next command
 
 def do_delete(message):
     '''delete <name>: removes a file unless it is missing or in use'''
@@ -224,7 +214,7 @@ def do_delete(message):
     real = real_path(path, name)
     if real is None or not os.path.isfile(real):
         return err(f'{name} does not exist.')
-    if not claim_write(path):
+    if not claim(path):
         return err(f'{name} is being used right now, so it was not deleted.')
     try:
         os.remove(real)
